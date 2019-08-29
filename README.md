@@ -1,5 +1,5 @@
 ## Android 线程池
-###线程池是有状态的，为了保存这种状态，FrameWork的工程师用了个int来存储，同时为了记录执行的线程数，牛x的工程师用一个字段来表示这个运行状态以及运行的线程数。
+### 线程池是有状态的，为了保存这种状态，FrameWork的工程师用了个int来存储，同时为了记录执行的线程数，牛x的工程师用一个字段来表示这个运行状态以及运行的线程数。
 * 下面就是那几个比较重要的标志：<br>
 * 
 		//保证原子性，AtomicInteger 
@@ -69,7 +69,7 @@
             reject(command);
     }
 
-###瞧一瞧addWorkder()这个方法，隐藏着什么猫腻...
+### 瞧一瞧addWorkder()这个方法，隐藏着什么猫腻...
 	
   	private boolean addWorker(Runnable firstTask, boolean core) {
         retry:
@@ -138,4 +138,169 @@
         return workerStarted;
     }
 
+---
+
+### addWorker()中创建了Worker，将FirstTask封装进了Worker，一个Worker也包含着一个Thread,并且调用了t.start(),将这个线程任务运了起来。那么我们来看一下，这个Worker吧。
+
+ 	private final class Worker
+        extends AbstractQueuedSynchronizer	//
+        implements Runnable					//实现了Runnable这个接口
+    {
+        /**
+         * This class will never be serialized, but we provide a
+         * serialVersionUID to suppress a javac warning.
+         */
+        private static final long serialVersionUID = 6138294804551838833L;
+
+        /** Thread this worker is running in.  Null if factory fails. */
+        final Thread thread;
+        /** Initial task to run.  Possibly null. */
+        Runnable firstTask;
+        /** Per-thread task counter */
+        volatile long completedTasks;
+
+        /**
+         * Creates with given first task and thread from ThreadFactory.
+         * @param firstTask the first task (null if none)
+         */
+        Worker(Runnable firstTask) {
+            setState(-1); // inhibit interrupts until runWorker
+            this.firstTask = firstTask;
+            this.thread = getThreadFactory().newThread(this);//实现这个thread.start(),回调当前Worker中的run(),是因为传入了这个this.
+        }
+
+        /** Delegates main run loop to outer runWorker. */
+        public void run() {									//这个实现Runnable的run方法，没有写@Override注解
+            runWorker(this);
+        }
+
+        // Lock methods
+        //
+        // The value 0 represents the unlocked state.
+        // The value 1 represents the locked state.
+
+        protected boolean isHeldExclusively() {
+            return getState() != 0;
+        }
+
+        protected boolean tryAcquire(int unused) {
+            if (compareAndSetState(0, 1)) {
+                setExclusiveOwnerThread(Thread.currentThread());
+                return true;
+            }
+            return false;
+        }
+
+        protected boolean tryRelease(int unused) {
+            setExclusiveOwnerThread(null);
+            setState(0);
+            return true;
+        }
+
+        public void lock()        { acquire(1); }
+        public boolean tryLock()  { return tryAcquire(1); }
+        public void unlock()      { release(1); }
+        public boolean isLocked() { return isHeldExclusively(); }
+
+        void interruptIfStarted() {
+            Thread t;
+            if (getState() >= 0 && (t = thread) != null && !t.isInterrupted()) {
+                try {
+                    t.interrupt();
+                } catch (SecurityException ignore) {
+                }
+            }
+        }
+    }
+
+---
+### Worker里面一旦开始调用start,里面的run()就得到回调，即执行这个runWorker方法。
+	runWorker(this);
+
+	final void runWorker(Worker w) {
+        Thread wt = Thread.currentThread();
+        Runnable task = w.firstTask;
+        w.firstTask = null;   //Woker里面的firstWorker这个引用置为null.
+        w.unlock(); // allow interrupts		//允许中断
+        boolean completedAbruptly = true;
+        try {
+            while (task != null || (task = getTask()) != null) {	//getTask从队列里面获取获取任务runnable
+                w.lock();	//上锁
+                // If pool is stopping, ensure thread is interrupted;
+                // if not, ensure thread is not interrupted.  This
+                // requires a recheck in second case to deal with
+                // shutdownNow race while clearing interrupt
+                if ((runStateAtLeast(ctl.get(), STOP) || 		//当前线程池非running状态
+                     (Thread.interrupted() &&					//当前线程 中断->true 没有中断->false 
+                      runStateAtLeast(ctl.get(), STOP))) &&
+                    !wt.isInterrupted())
+                    wt.interrupt(); 							//经过上面的判断，当前线程开小车了，立刻中断线程
+                try {
+                    beforeExecute(wt, task);	//线程给你，task给你，准备执行，你可以进行一些你想要的操作。
+                    Throwable thrown = null;
+                    try {
+                        task.run();				//执行
+                    } catch (RuntimeException x) {
+                        thrown = x; throw x;
+                    } catch (Error x) {
+                        thrown = x; throw x;
+                    } catch (Throwable x) {
+                        thrown = x; throw new Error(x);
+                    } finally {
+                        afterExecute(task, thrown); //线程执行完毕
+                    }
+                } finally {
+                    task = null;
+                    w.completedTasks++;
+                    w.unlock();
+                }
+            }
+            completedAbruptly = false;
+        } finally {
+            processWorkerExit(w, completedAbruptly);
+        }
+    }
+### getTask()方法
+
+    private Runnable getTask() {
+        boolean timedOut = false; // Did the last poll() time out?
+
+        for (;;) {
+            int c = ctl.get();
+            int rs = runStateOf(c);
+
+            // Check if queue empty only if necessary.
+            if (rs >= SHUTDOWN && (rs >= STOP || workQueue.isEmpty())) {
+                decrementWorkerCount();
+                return null;
+            }
+
+            int wc = workerCountOf(c);
+
+            // Are workers subject to culling?
+            boolean timed = allowCoreThreadTimeOut || wc > corePoolSize;
+
+            if ((wc > maximumPoolSize || (timed && timedOut))
+                && (wc > 1 || workQueue.isEmpty())) {
+                if (compareAndDecrementWorkerCount(c))
+                    return null;
+                continue;
+            }
+
+            try {
+                Runnable r = timed ?
+                    workQueue.poll(keepAliveTime, TimeUnit.NANOSECONDS) :
+                    workQueue.take();										//取出runnable
+                if (r != null)
+                    return r;
+                timedOut = true;
+            } catch (InterruptedException retry) {
+                timedOut = false;
+            }
+        }
+    }
+## 结尾语
+### Worker在运行的时候会去获取BlockQueue中的runnable任务。那么corePoolSize(核心线程)的意思也就是有多少个Worker。corePoolSize达到设置的数量之后，就会开始往BlockQueue队列中加入这些等待执行的runable。核心线程的getTask(),会去获取执行这些任务。当队列的容量达到标准之后，如果maximumPoolSize大于corePoolSize 那么接着创建Worker直接执行这些任务。也就是说，其实核心是Worker,几个Worker就可以同时处理几个runnable。至于说，线程池本事是有状态的，那么是谁控制的了？就是 AbstractQueuedSynchronizer ,Worker已经继承了这个类。看来，成也Worker，败也Worker。具体是怎么回事，且听我们下回分解...
+
+![](https://raw.githubusercontent.com/AKJoson/AKJoson.github.io/master/threadwork.jpg)
 
